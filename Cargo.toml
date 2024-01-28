@@ -1,0 +1,14 @@
+[package]
+name = "tauri-plugin-cohdb"
+version = "0.1.0"
+authors = ["ryantaylor"]
+description = ""
+edition = "2021"
+rust-version = "1.60"
+exclude = ["/examples", "/webview-dist", "/webview-src", "node_modules"]
+
+[dependencies]
+keyring = "2"
+oauth2 = "4"
+regex = "1"
+tauri = { version = "1", features = ["shell-open-api"] }
