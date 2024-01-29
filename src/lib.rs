@@ -1,19 +1,24 @@
+mod error;
+
+use crate::error::Error::{Keyring, Shell, TokenRequest};
+use crate::error::Result;
 use keyring::Entry;
 use oauth2::basic::BasicClient;
 use oauth2::reqwest::http_client;
-use oauth2::TokenResponse;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, Scope, TokenUrl,
+    RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use regex::Regex;
+use serde::Serialize;
 use std::sync::Mutex;
-use tauri::api::shell::open;
 use tauri::{
+    api::shell::open,
     plugin::{Builder, TauriPlugin},
     AppHandle, Manager, Runtime,
 };
 
+#[derive(Debug)]
 struct ActiveRequestState {
     pkce_challenge: PkceCodeChallenge,
     pkce_verifier: Option<PkceCodeVerifier>,
@@ -32,9 +37,15 @@ impl ActiveRequestState {
     }
 }
 
+#[derive(Debug)]
 struct PluginState {
     client: BasicClient,
     request: Mutex<Option<ActiveRequestState>>,
+}
+
+#[derive(Clone, Serialize)]
+struct ConnectionEventPayload {
+    connected: bool,
 }
 
 impl PluginState {
@@ -55,7 +66,7 @@ impl PluginState {
 }
 
 #[tauri::command]
-fn authenticate<R: Runtime>(handle: AppHandle<R>) {
+fn authenticate<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
     let state = handle.state::<PluginState>();
     let request = ActiveRequestState::new();
 
@@ -69,21 +80,19 @@ fn authenticate<R: Runtime>(handle: AppHandle<R>) {
 
     *state.request.lock().unwrap() = Some(request);
 
-    open(&handle.shell_scope(), auth_url, None).unwrap();
+    open(&handle.shell_scope(), auth_url, None).map_err(Shell)
 }
 
-pub fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) {
-    if let Some(mut request_state) = handle.state::<PluginState>().request.lock().unwrap().take() {
-        let re = Regex::new(
-            r"coh3stats://cohdb.com/oauth/authorize\?code=(?<code>.+)&state=(?<state>.+)",
-        )
-        .unwrap();
-        let Some(caps) = re.captures(request) else {
-            println!("invalid OAuth query!");
-            set_focus(handle);
-            return;
-        };
+pub fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) -> Result<()> {
+    let re =
+        Regex::new(r"coh3stats://cohdb.com/oauth/authorize\?code=(?<code>.+)&state=(?<state>.+)")
+            .unwrap();
+    let Some(caps) = re.captures(request) else {
+        set_focus(handle);
+        return Ok(());
+    };
 
+    if let Some(mut request_state) = handle.state::<PluginState>().request.lock().unwrap().take() {
         set_focus(handle);
 
         let token = handle
@@ -92,25 +101,51 @@ pub fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) {
             .exchange_code(AuthorizationCode::new(caps["code"].to_string()))
             .set_pkce_verifier(request_state.pkce_verifier.take().unwrap())
             .request(http_client)
-            .unwrap();
+            .map_err(|err| TokenRequest(format!("{err}")))?;
 
-        let access_token = Entry::new("cohdb", "access_token").unwrap();
+        let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
+        access_token.delete_password().ok();
         access_token
             .set_password(token.access_token().secret())
+            .map_err(Keyring)?;
+
+        handle
+            .emit_all(
+                "cohdb:connection",
+                ConnectionEventPayload { connected: true },
+            )
             .unwrap();
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn connected() -> Result<bool> {
+    let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
+    match access_token.get_password() {
+        Ok(_) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(err) => Err(Keyring(err)),
     }
 }
 
 #[tauri::command]
-fn connected() -> bool {
-    let access_token = Entry::new("cohdb", "access_token").unwrap();
-    access_token.get_password().is_ok()
-}
-
-#[tauri::command]
-fn disconnect() {
-    let access_token = Entry::new("cohdb", "access_token").unwrap();
-    access_token.delete_password().ok();
+fn disconnect<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
+    let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
+    match access_token.delete_password() {
+        Ok(_) => {
+            handle
+                .emit_all(
+                    "cohdb:connection",
+                    ConnectionEventPayload { connected: false },
+                )
+                .unwrap();
+            Ok(())
+        }
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(Keyring(err)),
+    }
 }
 
 pub fn init<R: Runtime>(client_id: String, redirect_uri: String) -> TauriPlugin<R> {

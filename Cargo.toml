@@ -11,4 +11,6 @@ exclude = ["/examples", "/webview-dist", "/webview-src", "node_modules"]
 keyring = "2"
 oauth2 = "4"
 regex = "1"
+serde = "1.0"
 tauri = { version = "1", features = ["shell-open-api"] }
+thiserror = "1.0"
