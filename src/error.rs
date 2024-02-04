@@ -7,6 +7,8 @@ pub enum Error {
     TokenRequest(String),
     #[error("There was an error accessing your keyring")]
     Keyring(#[from] keyring::Error),
+    #[error("There was an error with the cohdb API")]
+    Http(#[from] reqwest::Error),
 }
 
 impl serde::Serialize for Error {
