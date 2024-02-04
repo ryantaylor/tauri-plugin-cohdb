@@ -1,17 +1,19 @@
 mod error;
 
-use crate::error::Error::{Keyring, Shell, TokenRequest};
+use crate::error::Error::{Http, Keyring, Shell, TokenRequest};
 use crate::error::Result;
+use futures::lock::Mutex;
 use keyring::Entry;
 use oauth2::basic::BasicClient;
-use oauth2::reqwest::http_client;
+use oauth2::reqwest::async_http_client;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, PkceCodeVerifier,
     RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use regex::Regex;
-use serde::Serialize;
-use std::sync::Mutex;
+use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::{header, Client};
+use serde::{Deserialize, Serialize};
 use tauri::{
     api::shell::open,
     plugin::{Builder, TauriPlugin},
@@ -37,10 +39,19 @@ impl ActiveRequestState {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct UserState {
+    name: String,
+    profile_id: u64,
+    steam_id: u64,
+}
+
 #[derive(Debug)]
 struct PluginState {
-    client: BasicClient,
+    oauth_client: BasicClient,
     request: Mutex<Option<ActiveRequestState>>,
+    http_client: Mutex<Option<Client>>,
+    user: Mutex<Option<UserState>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -50,7 +61,7 @@ struct ConnectionEventPayload {
 
 impl PluginState {
     pub fn new(client_id: String, redirect_uri: String) -> PluginState {
-        let client = BasicClient::new(
+        let oauth_client = BasicClient::new(
             ClientId::new(client_id),
             None,
             AuthUrl::new("http://localhost:3000/oauth/authorize".to_string()).unwrap(),
@@ -59,31 +70,34 @@ impl PluginState {
         .set_redirect_uri(RedirectUrl::new(redirect_uri).unwrap());
 
         PluginState {
-            client,
+            oauth_client,
             request: Mutex::new(None),
+            http_client: Mutex::new(None),
+            user: Mutex::new(None),
         }
     }
 }
 
 #[tauri::command]
-fn authenticate<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
+async fn authenticate<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
     let state = handle.state::<PluginState>();
     let request = ActiveRequestState::new();
 
     let (auth_url, _) = state
-        .client
+        .oauth_client
         .authorize_url(|| request.csrf_token.clone())
         .add_scope(Scope::new("read".to_string()))
         .add_scope(Scope::new("write".to_string()))
         .set_pkce_challenge(request.pkce_challenge.clone())
         .url();
 
-    *state.request.lock().unwrap() = Some(request);
+    *state.request.lock().await = Some(request);
 
     open(&handle.shell_scope(), auth_url, None).map_err(Shell)
 }
 
-pub fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) -> Result<()> {
+pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) -> Result<()> {
+    let state = handle.state::<PluginState>();
     let re =
         Regex::new(r"coh3stats://cohdb.com/oauth/authorize\?code=(?<code>.+)&state=(?<state>.+)")
             .unwrap();
@@ -92,15 +106,16 @@ pub fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) -> Resul
         return Ok(());
     };
 
-    if let Some(mut request_state) = handle.state::<PluginState>().request.lock().unwrap().take() {
+    if let Some(mut request_state) = handle.state::<PluginState>().request.lock().await.take() {
         set_focus(handle);
 
         let token = handle
             .state::<PluginState>()
-            .client
+            .oauth_client
             .exchange_code(AuthorizationCode::new(caps["code"].to_string()))
             .set_pkce_verifier(request_state.pkce_verifier.take().unwrap())
-            .request(http_client)
+            .request_async(async_http_client)
+            .await
             .map_err(|err| TokenRequest(format!("{err}")))?;
 
         let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
@@ -108,6 +123,26 @@ pub fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) -> Resul
         access_token
             .set_password(token.access_token().secret())
             .map_err(Keyring)?;
+
+        let mut headers = HeaderMap::new();
+        let mut auth =
+            HeaderValue::try_from(format!("Bearer {}", token.access_token().secret())).unwrap();
+        auth.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, auth);
+
+        let client = Client::builder().default_headers(headers).build().unwrap();
+
+        let user = client
+            .get("http://localhost:3000/api/v1/users/me")
+            .send()
+            .await
+            .map_err(Http)?
+            .json::<UserState>()
+            .await
+            .map_err(Http)?;
+
+        *state.http_client.lock().await = Some(client);
+        *state.user.lock().await = Some(user);
 
         handle
             .emit_all(
@@ -131,10 +166,14 @@ fn connected() -> Result<bool> {
 }
 
 #[tauri::command]
-fn disconnect<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
+async fn disconnect<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
+    let state = handle.state::<PluginState>();
     let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
     match access_token.delete_password() {
         Ok(_) => {
+            *state.http_client.lock().await = None;
+            *state.user.lock().await = None;
+
             handle
                 .emit_all(
                     "cohdb:connection",
