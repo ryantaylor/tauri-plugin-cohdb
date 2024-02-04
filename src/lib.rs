@@ -1,8 +1,7 @@
 mod error;
 
-use crate::error::Error::{Http, Keyring, Shell, TokenRequest};
+use crate::error::Error::{Http, Keyring, Shell, TokenRequest, Unauthenticated};
 use crate::error::Result;
-use futures::lock::Mutex;
 use keyring::Entry;
 use oauth2::basic::BasicClient;
 use oauth2::reqwest::async_http_client;
@@ -12,8 +11,12 @@ use oauth2::{
 };
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::multipart::{Form, Part};
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::Read;
+use tauri::async_runtime::Mutex;
 use tauri::{
     api::shell::open,
     plugin::{Builder, TauriPlugin},
@@ -39,7 +42,7 @@ impl ActiveRequestState {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct UserState {
     name: String,
     profile_id: u64,
@@ -49,14 +52,10 @@ struct UserState {
 #[derive(Debug)]
 struct PluginState {
     oauth_client: BasicClient,
+    access_token: Entry,
     request: Mutex<Option<ActiveRequestState>>,
     http_client: Mutex<Option<Client>>,
     user: Mutex<Option<UserState>>,
-}
-
-#[derive(Clone, Serialize)]
-struct ConnectionEventPayload {
-    connected: bool,
 }
 
 impl PluginState {
@@ -68,11 +67,19 @@ impl PluginState {
             Some(TokenUrl::new("http://localhost:3000/oauth/token".to_string()).unwrap()),
         )
         .set_redirect_uri(RedirectUrl::new(redirect_uri).unwrap());
+        let access_token = Entry::new("cohdb", "access_token").unwrap();
+        let http_client = if let Ok(token) = access_token.get_password() {
+            println!("found token! creating client");
+            Some(build_client(&token).unwrap())
+        } else {
+            None
+        };
 
         PluginState {
             oauth_client,
+            access_token,
             request: Mutex::new(None),
-            http_client: Mutex::new(None),
+            http_client: Mutex::new(http_client),
             user: Mutex::new(None),
         }
     }
@@ -118,19 +125,13 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
             .await
             .map_err(|err| TokenRequest(format!("{err}")))?;
 
-        let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
-        access_token.delete_password().ok();
-        access_token
+        state.access_token.delete_password().ok();
+        state
+            .access_token
             .set_password(token.access_token().secret())
             .map_err(Keyring)?;
 
-        let mut headers = HeaderMap::new();
-        let mut auth =
-            HeaderValue::try_from(format!("Bearer {}", token.access_token().secret())).unwrap();
-        auth.set_sensitive(true);
-        headers.insert(header::AUTHORIZATION, auth);
-
-        let client = Client::builder().default_headers(headers).build().unwrap();
+        let client = build_client(token.access_token().secret()).unwrap();
 
         let user = client
             .get("http://localhost:3000/api/v1/users/me")
@@ -142,49 +143,60 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
             .map_err(Http)?;
 
         *state.http_client.lock().await = Some(client);
-        *state.user.lock().await = Some(user);
+        *state.user.lock().await = Some(user.clone());
 
-        handle
-            .emit_all(
-                "cohdb:connection",
-                ConnectionEventPayload { connected: true },
-            )
-            .unwrap();
+        handle.emit_all("cohdb:connection", user).unwrap();
     }
 
     Ok(())
 }
 
 #[tauri::command]
-fn connected() -> Result<bool> {
-    let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
-    match access_token.get_password() {
-        Ok(_) => Ok(true),
-        Err(keyring::Error::NoEntry) => Ok(false),
-        Err(err) => Err(Keyring(err)),
-    }
+async fn connected<R: Runtime>(handle: AppHandle<R>) -> Result<Option<UserState>> {
+    let state = handle.state::<PluginState>();
+    let user_option = state.user.lock().await;
+    Ok(user_option.clone())
 }
 
 #[tauri::command]
 async fn disconnect<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
     let state = handle.state::<PluginState>();
-    let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
-    match access_token.delete_password() {
-        Ok(_) => {
-            *state.http_client.lock().await = None;
-            *state.user.lock().await = None;
-
-            handle
-                .emit_all(
-                    "cohdb:connection",
-                    ConnectionEventPayload { connected: false },
-                )
-                .unwrap();
-            Ok(())
-        }
+    match state.access_token.delete_password() {
+        Ok(_) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(err) => Err(Keyring(err)),
-    }
+    }?;
+
+    *state.http_client.lock().await = None;
+    *state.user.lock().await = None;
+
+    handle
+        .emit_all("cohdb:connection", None::<UserState>)
+        .unwrap();
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn upload<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
+    let state = handle.state::<PluginState>();
+    let client_option = state.http_client.lock().await;
+    let client = client_option.as_ref().ok_or_else(|| Unauthenticated)?;
+    let mut file = File::open("/Users/ryantaylor/Downloads/fours.rec").unwrap();
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).unwrap();
+
+    let form = Form::new()
+        .text("replay[title]", "test upload")
+        .part("replay[file]", Part::bytes(buf));
+    let response = client
+        .post("http://localhost:3000/api/v1/replays/upload")
+        .multipart(form)
+        .send()
+        .await
+        .map_err(Http)?;
+    println!("response: {:?}", response);
+    Ok(())
 }
 
 pub fn init<R: Runtime>(client_id: String, redirect_uri: String) -> TauriPlugin<R> {
@@ -192,10 +204,32 @@ pub fn init<R: Runtime>(client_id: String, redirect_uri: String) -> TauriPlugin<
         .invoke_handler(tauri::generate_handler![
             authenticate,
             connected,
-            disconnect
+            disconnect,
+            upload,
         ])
         .setup(|app| {
             app.manage(PluginState::new(client_id, redirect_uri));
+
+            let app_ = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app_.state::<PluginState>();
+                let client_option = state.http_client.lock().await;
+                if let Some(client) = client_option.as_ref() {
+                    let user = client
+                        .get("http://localhost:3000/api/v1/users/me")
+                        .send()
+                        .await
+                        .unwrap()
+                        .json::<UserState>()
+                        .await
+                        .unwrap();
+
+                    println!("got user {:?}", user);
+
+                    *state.user.lock().await = Some(user);
+                }
+            });
+
             Ok(())
         })
         .build()
@@ -205,4 +239,16 @@ fn set_focus<R: Runtime>(handle: &AppHandle<R>) {
     for (_, val) in handle.windows().iter() {
         val.set_focus().ok();
     }
+}
+
+fn build_client(secret: &String) -> Result<Client> {
+    let mut headers = HeaderMap::new();
+    let mut auth = HeaderValue::try_from(format!("Bearer {}", secret)).unwrap();
+    auth.set_sensitive(true);
+    headers.insert(header::AUTHORIZATION, auth);
+
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .map_err(Http)
 }

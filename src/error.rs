@@ -9,6 +9,8 @@ pub enum Error {
     Keyring(#[from] keyring::Error),
     #[error("There was an error with the cohdb API")]
     Http(#[from] reqwest::Error),
+    #[error("Please connect your cohdb account first")]
+    Unauthenticated,
 }
 
 impl serde::Serialize for Error {
