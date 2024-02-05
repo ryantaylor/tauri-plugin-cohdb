@@ -156,7 +156,12 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
 }
 
 pub async fn is_connected<R: Runtime>(handle: AppHandle<R>) -> bool {
-    handle.state::<PluginState>().http_client.lock().await.is_some()
+    handle
+        .state::<PluginState>()
+        .http_client
+        .lock()
+        .await
+        .is_some()
 }
 
 #[tauri::command]
