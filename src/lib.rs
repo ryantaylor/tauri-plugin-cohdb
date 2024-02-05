@@ -3,6 +3,7 @@ mod error;
 use crate::error::Error::{Http, Keyring, Shell, TokenRequest, Unauthenticated};
 use crate::error::Result;
 use keyring::Entry;
+use log::{error, info, warn};
 use oauth2::basic::BasicClient;
 use oauth2::reqwest::async_http_client;
 use oauth2::{
@@ -14,8 +15,6 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::Read;
 use tauri::async_runtime::Mutex;
 use tauri::{
     api::shell::open,
@@ -59,7 +58,7 @@ struct PluginState {
 }
 
 impl PluginState {
-    pub fn new(client_id: String, redirect_uri: String) -> PluginState {
+    pub fn new(client_id: String, redirect_uri: String) -> Result<PluginState> {
         let oauth_client = BasicClient::new(
             ClientId::new(client_id),
             None,
@@ -67,21 +66,22 @@ impl PluginState {
             Some(TokenUrl::new("http://localhost:3000/oauth/token".to_string()).unwrap()),
         )
         .set_redirect_uri(RedirectUrl::new(redirect_uri).unwrap());
-        let access_token = Entry::new("cohdb", "access_token").unwrap();
+        let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
         let http_client = if let Ok(token) = access_token.get_password() {
-            println!("found token! creating client");
-            Some(build_client(&token).unwrap())
+            info!("found token in keyring, creating client");
+            Some(build_client(&token)?)
         } else {
+            info!("no token found in keyring, user not connected to cohdb");
             None
         };
 
-        PluginState {
+        Ok(PluginState {
             oauth_client,
             access_token,
             request: Mutex::new(None),
             http_client: Mutex::new(http_client),
             user: Mutex::new(None),
-        }
+        })
     }
 }
 
@@ -100,6 +100,7 @@ async fn authenticate<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
 
     *state.request.lock().await = Some(request);
 
+    info!("redirecting to auth URL: {auth_url}");
     open(&handle.shell_scope(), auth_url, None).map_err(Shell)
 }
 
@@ -109,6 +110,7 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
         Regex::new(r"coh3stats://cohdb.com/oauth/authorize\?code=(?<code>.+)&state=(?<state>.+)")
             .unwrap();
     let Some(caps) = re.captures(request) else {
+        warn!("got invalid deeplink: {request}");
         set_focus(handle);
         return Ok(());
     };
@@ -131,7 +133,7 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
             .set_password(token.access_token().secret())
             .map_err(Keyring)?;
 
-        let client = build_client(token.access_token().secret()).unwrap();
+        let client = build_client(token.access_token().secret())?;
 
         let user = client
             .get("http://localhost:3000/api/v1/users/me")
@@ -142,6 +144,8 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
             .await
             .map_err(Http)?;
 
+        info!("retrieved user: {:?}", user);
+
         *state.http_client.lock().await = Some(client);
         *state.user.lock().await = Some(user.clone());
 
@@ -149,6 +153,10 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
     }
 
     Ok(())
+}
+
+pub async fn is_connected<R: Runtime>(handle: AppHandle<R>) -> bool {
+    handle.state::<PluginState>().http_client.lock().await.is_some()
 }
 
 #[tauri::command]
@@ -181,21 +189,18 @@ async fn disconnect<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
 async fn upload<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
     let state = handle.state::<PluginState>();
     let client_option = state.http_client.lock().await;
-    let client = client_option.as_ref().ok_or_else(|| Unauthenticated)?;
-    let mut file = File::open("/Users/ryantaylor/Downloads/fours.rec").unwrap();
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).unwrap();
+    let client = client_option.as_ref().ok_or(Unauthenticated)?;
+    let file = std::fs::read("/Users/ryantaylor/Downloads/fours.rec").unwrap();
 
     let form = Form::new()
         .text("replay[title]", "test upload")
-        .part("replay[file]", Part::bytes(buf));
+        .part("replay[file]", Part::bytes(file).file_name("fours.rec"));
     let response = client
         .post("http://localhost:3000/api/v1/replays/upload")
         .multipart(form)
         .send()
         .await
         .map_err(Http)?;
-    println!("response: {:?}", response);
     Ok(())
 }
 
@@ -208,27 +213,36 @@ pub fn init<R: Runtime>(client_id: String, redirect_uri: String) -> TauriPlugin<
             upload,
         ])
         .setup(|app| {
-            app.manage(PluginState::new(client_id, redirect_uri));
+            match PluginState::new(client_id, redirect_uri) {
+                Ok(state) => {
+                    app.manage(state);
 
-            let app_ = app.clone();
-            tauri::async_runtime::spawn(async move {
-                let state = app_.state::<PluginState>();
-                let client_option = state.http_client.lock().await;
-                if let Some(client) = client_option.as_ref() {
-                    let user = client
-                        .get("http://localhost:3000/api/v1/users/me")
-                        .send()
-                        .await
-                        .unwrap()
-                        .json::<UserState>()
-                        .await
-                        .unwrap();
+                    let app_ = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app_.state::<PluginState>();
+                        let client_option = state.http_client.lock().await;
+                        if let Some(client) = client_option.as_ref() {
+                            let user = client
+                                .get("http://localhost:3000/api/v1/users/me")
+                                .send()
+                                .await
+                                .unwrap()
+                                .json::<UserState>()
+                                .await
+                                .unwrap();
 
-                    println!("got user {:?}", user);
+                            info!("got user on init: {:?}", user);
 
-                    *state.user.lock().await = Some(user);
+                            *state.user.lock().await = Some(user);
+                        } else {
+                            info!("not connected, skipping user query");
+                        }
+                    });
                 }
-            });
+                Err(err) => {
+                    error!("failed to init state: {err}");
+                }
+            }
 
             Ok(())
         })
