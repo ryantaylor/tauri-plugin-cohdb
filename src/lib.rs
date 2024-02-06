@@ -42,10 +42,10 @@ impl ActiveRequestState {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct UserState {
-    name: String,
-    profile_id: u64,
-    steam_id: u64,
+pub struct UserState {
+    pub name: String,
+    pub profile_id: u64,
+    pub steam_id: u64,
 }
 
 #[derive(Debug)]
@@ -155,20 +155,15 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
     Ok(())
 }
 
-pub async fn is_connected<R: Runtime>(handle: AppHandle<R>) -> bool {
-    handle
-        .state::<PluginState>()
-        .http_client
-        .lock()
-        .await
-        .is_some()
+pub async fn is_connected<R: Runtime>(handle: AppHandle<R>) -> Option<UserState> {
+    let state = handle.state::<PluginState>();
+    let user_option = state.user.lock().await;
+    user_option.clone()
 }
 
 #[tauri::command]
 async fn connected<R: Runtime>(handle: AppHandle<R>) -> Result<Option<UserState>> {
-    let state = handle.state::<PluginState>();
-    let user_option = state.user.lock().await;
-    Ok(user_option.clone())
+    Ok(is_connected(handle).await)
 }
 
 #[tauri::command]
@@ -190,17 +185,19 @@ async fn disconnect<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
-async fn upload<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
+pub async fn upload<R: Runtime>(
+    data: Vec<u8>,
+    file_name: String,
+    handle: AppHandle<R>,
+) -> Result<()> {
     let state = handle.state::<PluginState>();
     let client_option = state.http_client.lock().await;
     let client = client_option.as_ref().ok_or(Unauthenticated)?;
-    let file = std::fs::read("/Users/ryantaylor/Downloads/fours.rec").unwrap();
 
     let form = Form::new()
-        .text("replay[title]", "test upload")
-        .part("replay[file]", Part::bytes(file).file_name("fours.rec"));
-    let response = client
+        .text("replay[public]", "false")
+        .part("replay[file]", Part::bytes(data).file_name(file_name));
+    let _response = client
         .post("https://cohdb.com/api/v1/replays/upload")
         .multipart(form)
         .send()
@@ -215,7 +212,6 @@ pub fn init<R: Runtime>(client_id: String, redirect_uri: String) -> TauriPlugin<
             authenticate,
             connected,
             disconnect,
-            upload,
         ])
         .setup(|app| {
             match PluginState::new(client_id, redirect_uri) {
