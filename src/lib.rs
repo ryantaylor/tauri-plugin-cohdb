@@ -62,8 +62,8 @@ impl PluginState {
         let oauth_client = BasicClient::new(
             ClientId::new(client_id),
             None,
-            AuthUrl::new("http://localhost:3000/oauth/authorize".to_string()).unwrap(),
-            Some(TokenUrl::new("http://localhost:3000/oauth/token".to_string()).unwrap()),
+            AuthUrl::new("https://cohdb.com/oauth/authorize".to_string()).unwrap(),
+            Some(TokenUrl::new("https://cohdb.com/oauth/token".to_string()).unwrap()),
         )
         .set_redirect_uri(RedirectUrl::new(redirect_uri).unwrap());
         let access_token = Entry::new("cohdb", "access_token").map_err(Keyring)?;
@@ -136,7 +136,7 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
         let client = build_client(token.access_token().secret())?;
 
         let user = client
-            .get("http://localhost:3000/api/v1/users/me")
+            .get("https://cohdb.com/api/v1/users/me")
             .send()
             .await
             .map_err(Http)?
@@ -201,7 +201,7 @@ async fn upload<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
         .text("replay[title]", "test upload")
         .part("replay[file]", Part::bytes(file).file_name("fours.rec"));
     let response = client
-        .post("http://localhost:3000/api/v1/replays/upload")
+        .post("https://cohdb.com/api/v1/replays/upload")
         .multipart(form)
         .send()
         .await
@@ -228,7 +228,7 @@ pub fn init<R: Runtime>(client_id: String, redirect_uri: String) -> TauriPlugin<
                         let client_option = state.http_client.lock().await;
                         if let Some(client) = client_option.as_ref() {
                             let user = client
-                                .get("http://localhost:3000/api/v1/users/me")
+                                .get("https://cohdb.com/api/v1/users/me")
                                 .send()
                                 .await
                                 .unwrap()
