@@ -44,7 +44,7 @@ impl ActiveRequestState {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserState {
     pub name: String,
-    pub profile_id: u64,
+    pub profile_id: Option<u64>,
     pub steam_id: u64,
 }
 
