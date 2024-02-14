@@ -144,7 +144,16 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
     Ok(())
 }
 
-pub async fn is_connected<R: Runtime>(handle: AppHandle<R>) -> Option<User> {
+pub async fn is_connected<R: Runtime>(handle: AppHandle<R>) -> bool {
+    handle
+        .state::<PluginState>()
+        .http_client
+        .lock()
+        .await
+        .is_some()
+}
+
+pub async fn connected_user<R: Runtime>(handle: AppHandle<R>) -> Option<User> {
     let state = handle.state::<PluginState>();
     let user_option = state.user.lock().await;
     user_option.clone()
@@ -152,7 +161,7 @@ pub async fn is_connected<R: Runtime>(handle: AppHandle<R>) -> Option<User> {
 
 #[tauri::command]
 async fn connected<R: Runtime>(handle: AppHandle<R>) -> Result<Option<User>> {
-    Ok(is_connected(handle).await)
+    Ok(connected_user(handle).await)
 }
 
 #[tauri::command]
