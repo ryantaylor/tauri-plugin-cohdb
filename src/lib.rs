@@ -185,7 +185,7 @@ pub async fn upload<R: Runtime>(
     data: Vec<u8>,
     file_name: String,
     handle: AppHandle<R>,
-) -> Result<()> {
+) -> Result<UploadResponse> {
     let state = handle.state::<PluginState>();
     let client_option = state.http_client.lock().await;
     let client = client_option.as_ref().ok_or(Unauthenticated)?;
@@ -201,14 +201,14 @@ pub async fn upload<R: Runtime>(
         .map_err(Http)?;
 
     let upload = UploadResponse::from_response(res).await?;
-    if let UploadResponse::Ok(replay) = upload {
+    if let UploadResponse::Ok(replay) = upload.clone() {
         info!("upload successful, got replay: {replay:?}");
         handle.emit_all("cohdb:upload", replay).unwrap();
     } else {
         warn!("error uploading replay: {upload:?}");
     }
 
-    Ok(())
+    Ok(upload)
 }
 
 pub fn init<R: Runtime>(client_id: String, redirect_uri: String) -> TauriPlugin<R> {

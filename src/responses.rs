@@ -37,7 +37,7 @@ pub struct Replay {
 
 type ErrorMessages = HashMap<String, Vec<String>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UploadResponse {
     Ok(Replay),
     Unauthenticated,
