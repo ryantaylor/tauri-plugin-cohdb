@@ -1,4 +1,5 @@
 mod error;
+mod responses;
 
 use crate::error::Error::{Http, Keyring, Shell, TokenRequest, Unauthenticated};
 use crate::error::Result;
@@ -14,8 +15,8 @@ use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use reqwest::{header, Client};
-use serde::{Deserialize, Serialize};
-use tauri::async_runtime::Mutex;
+use responses::{MeResponse, UploadResponse, User};
+use tauri::async_runtime::{JoinHandle, Mutex};
 use tauri::{
     api::shell::open,
     plugin::{Builder, TauriPlugin},
@@ -41,20 +42,13 @@ impl ActiveRequestState {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct UserState {
-    pub name: String,
-    pub profile_id: Option<u64>,
-    pub steam_id: u64,
-}
-
 #[derive(Debug)]
 struct PluginState {
     oauth_client: BasicClient,
     access_token: Entry,
     request: Mutex<Option<ActiveRequestState>>,
     http_client: Mutex<Option<Client>>,
-    user: Mutex<Option<UserState>>,
+    user: Mutex<Option<User>>,
 }
 
 impl PluginState {
@@ -134,35 +128,30 @@ pub async fn retrieve_token<R: Runtime>(request: &str, handle: &AppHandle<R>) ->
             .map_err(Keyring)?;
 
         let client = build_client(token.access_token().secret())?;
+        let me = query_user(&client).await?;
+        if let MeResponse::Ok(user) = me {
+            info!("retrieved user: {user:?}");
 
-        let user = client
-            .get("https://cohdb.com/api/v1/users/me")
-            .send()
-            .await
-            .map_err(Http)?
-            .json::<UserState>()
-            .await
-            .map_err(Http)?;
+            *state.http_client.lock().await = Some(client);
+            *state.user.lock().await = Some(user.clone());
 
-        info!("retrieved user: {:?}", user);
-
-        *state.http_client.lock().await = Some(client);
-        *state.user.lock().await = Some(user.clone());
-
-        handle.emit_all("cohdb:connection", user).unwrap();
+            handle.emit_all("cohdb:connection", user).unwrap();
+        } else {
+            error!("error querying user: {me:?}");
+        }
     }
 
     Ok(())
 }
 
-pub async fn is_connected<R: Runtime>(handle: AppHandle<R>) -> Option<UserState> {
+pub async fn is_connected<R: Runtime>(handle: AppHandle<R>) -> Option<User> {
     let state = handle.state::<PluginState>();
     let user_option = state.user.lock().await;
     user_option.clone()
 }
 
 #[tauri::command]
-async fn connected<R: Runtime>(handle: AppHandle<R>) -> Result<Option<UserState>> {
+async fn connected<R: Runtime>(handle: AppHandle<R>) -> Result<Option<User>> {
     Ok(is_connected(handle).await)
 }
 
@@ -178,9 +167,7 @@ async fn disconnect<R: Runtime>(handle: AppHandle<R>) -> Result<()> {
     *state.http_client.lock().await = None;
     *state.user.lock().await = None;
 
-    handle
-        .emit_all("cohdb:connection", None::<UserState>)
-        .unwrap();
+    handle.emit_all("cohdb:connection", None::<User>).unwrap();
 
     Ok(())
 }
@@ -197,12 +184,21 @@ pub async fn upload<R: Runtime>(
     let form = Form::new()
         .text("replay[public]", "false")
         .part("replay[file]", Part::bytes(data).file_name(file_name));
-    let _response = client
+    let res = client
         .post("https://cohdb.com/api/v1/replays/upload")
         .multipart(form)
         .send()
         .await
         .map_err(Http)?;
+
+    let upload = UploadResponse::from_response(res).await?;
+    if let UploadResponse::Ok(replay) = upload {
+        info!("upload successful, got replay: {replay:?}");
+        handle.emit_all("cohdb:upload", replay).unwrap();
+    } else {
+        warn!("error uploading replay: {upload:?}");
+    }
+
     Ok(())
 }
 
@@ -217,32 +213,9 @@ pub fn init<R: Runtime>(client_id: String, redirect_uri: String) -> TauriPlugin<
             match PluginState::new(client_id, redirect_uri) {
                 Ok(state) => {
                     app.manage(state);
-
-                    let app_ = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state = app_.state::<PluginState>();
-                        let client_option = state.http_client.lock().await;
-                        if let Some(client) = client_option.as_ref() {
-                            let user = client
-                                .get("https://cohdb.com/api/v1/users/me")
-                                .send()
-                                .await
-                                .unwrap()
-                                .json::<UserState>()
-                                .await
-                                .unwrap();
-
-                            info!("got user on init: {:?}", user);
-
-                            *state.user.lock().await = Some(user);
-                        } else {
-                            info!("not connected, skipping user query");
-                        }
-                    });
+                    init_user(app.clone());
                 }
-                Err(err) => {
-                    error!("failed to init state: {err}");
-                }
+                Err(err) => error!("failed to init state: {err}"),
             }
 
             Ok(())
@@ -250,10 +223,23 @@ pub fn init<R: Runtime>(client_id: String, redirect_uri: String) -> TauriPlugin<
         .build()
 }
 
-fn set_focus<R: Runtime>(handle: &AppHandle<R>) {
-    for (_, val) in handle.windows().iter() {
-        val.set_focus().ok();
-    }
+fn init_user<R: Runtime>(handle: AppHandle<R>) -> JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let state = handle.state::<PluginState>();
+        let client_option = state.http_client.lock().await;
+        if let Some(client) = client_option.as_ref() {
+            match query_user(client).await {
+                Ok(MeResponse::Ok(user)) => {
+                    info!("got user on init: {:?}", user);
+                    *state.user.lock().await = Some(user);
+                }
+                Ok(res) => warn!("there was a problem loading the user: {res:?}"),
+                Err(err) => error!("failed to query user: {err}"),
+            }
+        } else {
+            info!("not connected, skipping user query");
+        }
+    })
 }
 
 fn build_client(secret: &String) -> Result<Client> {
@@ -266,4 +252,19 @@ fn build_client(secret: &String) -> Result<Client> {
         .default_headers(headers)
         .build()
         .map_err(Http)
+}
+
+async fn query_user(client: &Client) -> Result<MeResponse> {
+    let res = client
+        .get("https://cohdb.com/api/v1/users/me")
+        .send()
+        .await
+        .map_err(Http)?;
+
+    MeResponse::from_response(res).await
+}
+fn set_focus<R: Runtime>(handle: &AppHandle<R>) {
+    for (_, val) in handle.windows().iter() {
+        val.set_focus().ok();
+    }
 }
