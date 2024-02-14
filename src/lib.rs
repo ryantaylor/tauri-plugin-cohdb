@@ -1,5 +1,5 @@
-mod error;
-mod responses;
+pub mod error;
+pub mod responses;
 
 use crate::error::Error::{Http, Keyring, Shell, TokenRequest, Unauthenticated};
 use crate::error::Result;
